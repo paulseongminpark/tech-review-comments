@@ -1,0 +1,121 @@
+name: Update Post Comments
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "comments.md"
+
+jobs:
+  update-comments:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout comments repo
+        uses: actions/checkout@v4
+
+      - name: Parse and update comments in tech-review repo
+        env:
+          TECH_REVIEW_TOKEN: ${{ secrets.TECH_REVIEW_TOKEN }}
+          GITHUB_OWNER: paulseongminpark
+          GITHUB_REPO: tech-review
+          GITHUB_BRANCH: master
+        run: |
+          # comments.md 읽기
+          COMMENTS_FILE="comments.md"
+
+          # Python으로 파싱 및 업데이트
+          python3 << 'PYTHON_SCRIPT'
+          import re
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+          import base64
+
+          OWNER = os.environ["GITHUB_OWNER"]
+          REPO = os.environ["GITHUB_REPO"]
+          BRANCH = os.environ["GITHUB_BRANCH"]
+          TOKEN = os.environ["TECH_REVIEW_TOKEN"]
+          HEADERS = {
+              "Authorization": f"token {TOKEN}",
+              "Accept": "application/vnd.github.v3+json",
+              "User-Agent": "tech-review-comments-bot",
+              "Content-Type": "application/json",
+          }
+
+          def github_api(method, path, data=None):
+              url = f"https://api.github.com{path}"
+              body = json.dumps(data).encode() if data else None
+              req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read())
+
+          def get_file(path):
+              status, data = github_api("GET", f"/repos/{OWNER}/{REPO}/contents/{path}?ref={BRANCH}")
+              if status == 200:
+                  content = base64.b64decode(data["content"]).decode("utf-8")
+                  return content, data["sha"]
+              return None, None
+
+          def update_file(path, new_content, sha, message):
+              encoded = base64.b64encode(new_content.encode()).decode()
+              status, data = github_api("PUT", f"/repos/{OWNER}/{REPO}/contents/{path}", {
+                  "message": message,
+                  "content": encoded,
+                  "sha": sha,
+                  "branch": BRANCH,
+              })
+              return status in (200, 201)
+
+          # comments.md 파싱
+          # 형식: ## YYYY-MM-DD lang
+          with open("comments.md", "r", encoding="utf-8") as f:
+              raw = f.read()
+
+          # 각 날짜+언어 블록 추출
+          pattern = re.compile(
+              r'^## (\d{4}-\d{2}-\d{2})\s+(ko|en)\s*\n((?:- \*\*.+\n?)*)',
+              re.MULTILINE
+          )
+          entries = pattern.findall(raw)
+
+          if not entries:
+              print("ℹ️ 업데이트할 Comments 항목 없음")
+              exit(0)
+
+          updated_count = 0
+          for date, lang, comments_block in entries:
+              comments_block = comments_block.strip()
+              if not comments_block:
+                  continue
+
+              post_path = f"_posts/{lang}/{date}-daily.md"
+              print(f"📝 처리 중: {post_path}")
+
+              content, sha = get_file(post_path)
+              if content is None:
+                  print(f"⚠️ 포스트 파일 없음: {post_path}")
+                  continue
+
+              # Comments 섹션 찾아서 교체
+              if "## Comments" not in content:
+                  print(f"⚠️ Comments 섹션 없음: {post_path}")
+                  continue
+
+              # Comments 섹션 이후 내용 교체
+              parts = content.split("## Comments\n", 1)
+              new_content = parts[0] + "## Comments\n" + comments_block + "\n"
+
+              commit_msg = f"[tech-review] {date} {lang} comments 업데이트"
+              if update_file(post_path, new_content, sha, commit_msg):
+                  print(f"✅ 업데이트 완료: {post_path}")
+                  updated_count += 1
+              else:
+                  print(f"❌ 업데이트 실패: {post_path}")
+
+          print(f"\n🎉 완료: {updated_count}개 포스트 업데이트")
+          PYTHON_SCRIPT
