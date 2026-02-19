@@ -1,10 +1,12 @@
-name: Update Post Comments
+name: Update Tech Review Comments
 
 on:
   push:
-    branches: [main]
     paths:
       - "comments.md"
+
+permissions:
+  contents: read
 
 jobs:
   update-comments:
@@ -14,104 +16,71 @@ jobs:
       - name: Checkout comments repo
         uses: actions/checkout@v4
 
-      - name: Parse and update comments in tech-review repo
-        env:
-          TECH_REVIEW_TOKEN: ${{ secrets.TECH_REVIEW_TOKEN }}
-          GITHUB_OWNER: paulseongminpark
-          GITHUB_REPO: tech-review
-          GITHUB_BRANCH: master
+      - name: Checkout tech-review repo
+        uses: actions/checkout@v4
+        with:
+          repository: paulseongminpark/tech-review
+          token: ${{ secrets.TECH_REVIEW_TOKEN }}
+          path: tech-review
+
+      - name: Parse and apply comments
         run: |
-          python3 << 'PYTHON_SCRIPT'
-          import re
-          import os
-          import json
-          import urllib.request
-          import urllib.error
-          import base64
+          python3 - << 'PYEOF'
+          import re, os, sys
           from collections import defaultdict
 
-          OWNER = os.environ["GITHUB_OWNER"]
-          REPO = os.environ["GITHUB_REPO"]
-          BRANCH = os.environ["GITHUB_BRANCH"]
-          TOKEN = os.environ["TECH_REVIEW_TOKEN"]
-          HEADERS = {
-              "Authorization": f"token {TOKEN}",
-              "Accept": "application/vnd.github.v3+json",
-              "User-Agent": "tech-review-comments-bot",
-              "Content-Type": "application/json",
-          }
-
-          def github_api(method, path, data=None):
-              url = f"https://api.github.com{path}"
-              body = json.dumps(data).encode() if data else None
-              req = urllib.request.Request(url, data=body, headers=HEADERS, method=method)
-              try:
-                  with urllib.request.urlopen(req) as resp:
-                      return resp.status, json.loads(resp.read())
-              except urllib.error.HTTPError as e:
-                  return e.code, json.loads(e.read())
-
-          def get_file(path):
-              status, data = github_api("GET", f"/repos/{OWNER}/{REPO}/contents/{path}?ref={BRANCH}")
-              if status == 200:
-                  content = base64.b64decode(data["content"]).decode("utf-8")
-                  return content, data["sha"]
-              return None, None
-
-          def update_file(path, new_content, sha, message):
-              encoded = base64.b64encode(new_content.encode()).decode()
-              status, data = github_api("PUT", f"/repos/{OWNER}/{REPO}/contents/{path}", {
-                  "message": message,
-                  "content": encoded,
-                  "sha": sha,
-                  "branch": BRANCH,
-              })
-              return status in (200, 201)
-
-          # comments.md 파싱 — [YYYYMMDD 내용] 형식
           with open("comments.md", "r", encoding="utf-8") as f:
               raw = f.read()
 
           matches = re.findall(r'\[(\d{8})\s+(.+?)\]', raw)
+
           if not matches:
               print("업데이트할 코멘트 없음")
-              exit(0)
+              sys.exit(0)
 
           date_comments = defaultdict(list)
           for date8, text in matches:
               date = f"{date8[:4]}-{date8[4:6]}-{date8[6:]}"
               date_comments[date].append(text)
 
-          updated_count = 0
+          updated = []
           for date, comments in date_comments.items():
               body = "\n".join(f"- {c}" for c in comments)
               for lang in ["ko", "en"]:
-                  post_path = f"_posts/{lang}/{date}-daily-tech-review.md"
-                  print(f"처리 중: {post_path}")
-
-                  content, sha = get_file(post_path)
-                  if content is None:
-                      print(f"포스트 파일 없음: {post_path}")
+                  post_path = f"tech-review/_posts/{lang}/{date}-daily-tech-review.md"
+                  if not os.path.exists(post_path):
+                      print(f"포스트 없음: {post_path}")
                       continue
-
+                  with open(post_path, "r", encoding="utf-8") as f:
+                      content = f.read()
                   if "## Comments" not in content:
-                      print(f"Comments 섹션 없음: {post_path}")
                       continue
-
                   parts = content.split("## Comments", 1)
                   new_content = parts[0] + "## Comments\n\n" + body + "\n"
+                  with open(post_path, "w", encoding="utf-8") as f:
+                      f.write(new_content)
+                  updated.append(f"{date}/{lang}")
+                  print(f"✓ {post_path}")
 
-                  commit_msg = f"[tech-review] {date} comments 업데이트"
-                  if update_file(post_path, new_content, sha, commit_msg):
-                      print(f"완료: {post_path}")
-                      updated_count += 1
-                  else:
-                      print(f"실패: {post_path}")
+          print(f"완료: {', '.join(updated)}" if updated else "변경 없음")
+          PYEOF
 
-          print(f"총 {updated_count}개 업데이트")
-          PYTHON_SCRIPT
+      - name: Commit and push to tech-review
+        run: |
+          cd tech-review
+          git config user.name "comments-bot"
+          git config user.email "bot@tech-review.local"
+          git add _posts/
+          if git diff --cached --quiet; then
+            echo "변경사항 없음"
+          else
+            git commit -m "[tech-review] comments 업데이트"
+            git push
+            echo "CHANGED=true" >> $GITHUB_ENV
+          fi
 
       - name: Trigger deploy
+        if: env.CHANGED == 'true'
         run: |
           curl -X POST \
             -H "Authorization: token ${{ secrets.TECH_REVIEW_TOKEN }}" \
